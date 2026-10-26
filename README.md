@@ -8,8 +8,11 @@ key exchange and authenticated with ML-DSA-65 identity keys.
 Anyone can join the mesh, but joining does not make a node trusted. Trust is a separate
 allowlist of node IDs that you control.
 
-> **Status:** early MVP. Direct links between nodes work. Multi-hop routing is not built yet.
-> Latchkey has not had a security audit, so don't rely on it to protect anything important.
+Messages to nodes you aren't connected to are routed across the mesh, but only through relays
+you trust, and they are encrypted end to end so relays can't read them.
+
+> **Status:** early MVP. Direct links and multi-hop messaging work. Latchkey has not had a
+> security audit, so don't rely on it to protect anything important.
 
 ## Quick start
 
@@ -26,7 +29,8 @@ Within a few seconds, the nodes discover each other and connect. In another term
 latchkey id                     # this node's ID
 latchkey peers                  # connected peers and whether you trust them
 latchkey ping 3f9a              # round-trip time to a peer (any unique ID prefix works)
-latchkey send 3f9a hello there  # direct message; it shows up in the peer's `latchkey run` output
+latchkey send 3f9a hello there  # message; it shows up in the peer's `latchkey run` output
+latchkey routes                 # every node in the mesh and the relays a message would take
 latchkey trust 3f9a0c…           # add a peer to your allowlist (full 64-character ID only)
 latchkey untrust 3f9a
 latchkey trusted                # list the allowlist
@@ -70,6 +74,9 @@ enabled = true                    # multicast announce and discovery
 port = 47471                      # UDP port, the same on every node
 ipv6 = true                       # also use IPv6 link-local multicast
 interval_secs = 5                 # time between announcements
+
+[routing]
+relay_for = "anyone"              # or "trusted": only relay messages handed over by trusted peers
 ```
 
 ## Using it as a library
@@ -80,7 +87,8 @@ use latchkey::{Config, Event, Node};
 let node = Node::start(Config::default()).await?;
 let mut events = node.subscribe();
 while let Ok(event) = events.recv().await {
-    if let Event::Message { from, trusted, data } = event {
+    if let Event::Message { from, trusted, data, via } = event {
+        // `via` lists the relays the message came through, and is empty for a direct message.
         node.send(&from, b"got it".to_vec()).await?;
     }
 }
@@ -100,11 +108,15 @@ In brief:
 3. **Identity.** A node's ID is the SHA3-256 hash of its ML-DSA-65 public key, so an ID can't
    be claimed without the matching private key.
 4. **Trust.** Every connected peer is authenticated, but only peers on your allowlist are
-   trusted. Once routing exists, only trusted nodes will relay your traffic.
+   trusted.
+5. **Routing.** Each node floods a signed list of its neighbors and its current receiving keys.
+   To reach a node it isn't connected to, a sender picks the shortest path whose relays it
+   all trusts, and seals the message to the destination with the same hybrid X25519 +
+   ML-KEM-768 construction, signed with ML-DSA-65. Relays see who is talking to whom, but not
+   what they say.
 
 ## Roadmap
 
-- Multi-hop routing that relays only through trusted nodes
 - A TUN interface, so ordinary IP applications can run over the mesh
 - PKI or delegated trust, so you don't have to list every node by hand
 - Windows support for the daemon and CLI (the library builds, but the control socket is Unix-only)

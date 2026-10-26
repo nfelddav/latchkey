@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
-use latchkey::config::DiscoveryConfig;
+use latchkey::config::{DiscoveryConfig, RelayPolicy};
 use latchkey::{Config, Event, Node, NodeId};
 use tokio::sync::broadcast;
 
@@ -29,6 +29,7 @@ fn config() -> Config {
             enabled: false,
             ..Default::default()
         },
+        routing: Default::default(),
     }
 }
 
@@ -49,6 +50,7 @@ async fn next_message(events: &mut broadcast::Receiver<Event>) -> (NodeId, bool,
                 from,
                 trusted,
                 data,
+                ..
             } = events.recv().await.unwrap()
             {
                 return (from, trusted, data);
@@ -283,4 +285,142 @@ async fn send_fails_instead_of_hanging_when_the_peer_stops_reading() {
     println!("send failed as expected: {outcome:#}");
     drop(stalled);
     a.shutdown();
+}
+
+async fn next_routed(events: &mut broadcast::Receiver<Event>) -> (NodeId, Vec<u8>, Vec<NodeId>) {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Event::Message {
+                from, data, via, ..
+            } = events.recv().await.unwrap()
+            {
+                return (from, data, via);
+            }
+        }
+    })
+    .await
+    .expect("no message arrived")
+}
+
+/// Connect `nodes` in a line, each to the next.
+async fn chain(nodes: &[&Node]) {
+    for pair in nodes.windows(2) {
+        pair[1].connect(pair[0].local_addr()).await.unwrap();
+    }
+}
+
+/// A and B are not connected to each other, only to R. Once A trusts R, A can reach B through
+/// it, and B learns which relay carried the message.
+#[tokio::test]
+async fn messages_route_through_a_trusted_relay() {
+    let a = Node::start(config()).await.unwrap();
+    let r = Node::start(config()).await.unwrap();
+    let b = Node::start(config()).await.unwrap();
+    let mut b_events = b.subscribe();
+    chain(&[&a, &r, &b]).await;
+
+    wait_for("a to learn about b", || {
+        a.routes().iter().any(|route| route.id == b.id())
+    })
+    .await;
+    // A doesn't trust R yet, so there is no route it may use.
+    assert_eq!(a.route(&b.id()), None);
+    assert!(a.send(&b.id(), b"too soon".to_vec()).await.is_err());
+
+    a.trust(r.id()).unwrap();
+    wait_for("a to find a route to b", || a.route(&b.id()).is_some()).await;
+    assert_eq!(a.route(&b.id()), Some(vec![r.id()]));
+    assert_eq!(
+        a.send(&b.id(), b"hi b".to_vec()).await.unwrap(),
+        vec![r.id()]
+    );
+    assert_eq!(
+        next_routed(&mut b_events).await,
+        (a.id(), b"hi b".to_vec(), vec![r.id()])
+    );
+
+    // B doesn't trust R, so it cannot answer the same way.
+    assert!(b.send(&a.id(), b"reply".to_vec()).await.is_err());
+
+    for n in [a, r, b] {
+        n.shutdown();
+    }
+}
+
+#[tokio::test]
+async fn messages_cross_several_relays() {
+    let nodes = start_nodes(4).await;
+    let [a, r1, r2, b] = &nodes[..] else {
+        unreachable!()
+    };
+    let mut b_events = b.subscribe();
+    chain(&[a, r1, r2, b]).await;
+    a.trust(r1.id()).unwrap();
+    a.trust(r2.id()).unwrap();
+
+    wait_for("a to find a route to b", || a.route(&b.id()).is_some()).await;
+    assert_eq!(a.route(&b.id()), Some(vec![r1.id(), r2.id()]));
+    a.send(&b.id(), b"far".to_vec()).await.unwrap();
+    assert_eq!(
+        next_routed(&mut b_events).await,
+        (a.id(), b"far".to_vec(), vec![r1.id(), r2.id()])
+    );
+    for n in &nodes {
+        n.shutdown();
+    }
+}
+
+async fn start_nodes(n: usize) -> Vec<Node> {
+    let mut nodes = Vec::new();
+    for _ in 0..n {
+        nodes.push(Node::start(config()).await.unwrap());
+    }
+    nodes
+}
+
+/// A relay set to relay only for trusted peers drops messages handed over by anyone else.
+#[tokio::test]
+async fn relays_can_refuse_untrusted_senders() {
+    let a = Node::start(config()).await.unwrap();
+    let r = Node::start(Config {
+        routing: latchkey::config::RoutingConfig {
+            relay_for: RelayPolicy::Trusted,
+        },
+        ..config()
+    })
+    .await
+    .unwrap();
+    let b = Node::start(config()).await.unwrap();
+    let mut b_events = b.subscribe();
+    chain(&[&a, &r, &b]).await;
+    a.trust(r.id()).unwrap();
+    wait_for("a to find a route to b", || a.route(&b.id()).is_some()).await;
+
+    a.send(&b.id(), b"dropped".to_vec()).await.unwrap();
+    let got = tokio::time::timeout(Duration::from_millis(500), next_routed(&mut b_events)).await;
+    assert!(got.is_err(), "relay forwarded for an untrusted sender");
+
+    r.trust(a.id()).unwrap();
+    a.send(&b.id(), b"allowed".to_vec()).await.unwrap();
+    assert_eq!(next_routed(&mut b_events).await.1, b"allowed");
+
+    for n in [a, r, b] {
+        n.shutdown();
+    }
+}
+
+/// When a relay leaves, routes through it disappear once its neighbors re-advertise.
+#[tokio::test]
+async fn routes_follow_topology_changes() {
+    let a = Node::start(config()).await.unwrap();
+    let r = Node::start(config()).await.unwrap();
+    let b = Node::start(config()).await.unwrap();
+    chain(&[&a, &r, &b]).await;
+    a.trust(r.id()).unwrap();
+    wait_for("a to find a route to b", || a.route(&b.id()).is_some()).await;
+
+    r.shutdown();
+    wait_for("the route to b to go away", || a.route(&b.id()).is_none()).await;
+    a.shutdown();
+    b.shutdown();
 }

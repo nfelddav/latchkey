@@ -43,12 +43,18 @@ pub enum Message {
     Pong(u64),
     /// Application data addressed to the receiving node.
     Data(Vec<u8>),
+    /// A signed link-state advertisement, flooded through the mesh (see `routing`).
+    LinkState(Vec<u8>),
+    /// An end-to-end sealed envelope travelling along a route (see `routing`).
+    Routed(Vec<u8>),
 }
 
 const TAG_AUTH: u8 = 1;
 const TAG_PING: u8 = 2;
 const TAG_PONG: u8 = 3;
 const TAG_DATA: u8 = 4;
+const TAG_LINK_STATE: u8 = 5;
+const TAG_ROUTED: u8 = 6;
 
 impl Message {
     pub fn encode(&self) -> Vec<u8> {
@@ -67,6 +73,8 @@ impl Message {
             Message::Ping(n) => [&[TAG_PING][..], &n.to_be_bytes()].concat(),
             Message::Pong(n) => [&[TAG_PONG][..], &n.to_be_bytes()].concat(),
             Message::Data(data) => [&[TAG_DATA][..], data].concat(),
+            Message::LinkState(lsa) => [&[TAG_LINK_STATE][..], lsa].concat(),
+            Message::Routed(envelope) => [&[TAG_ROUTED][..], envelope].concat(),
         }
     }
 
@@ -93,6 +101,8 @@ impl Message {
             TAG_PING => Message::Ping(u64_from(rest)?),
             TAG_PONG => Message::Pong(u64_from(rest)?),
             TAG_DATA => Message::Data(rest.to_vec()),
+            TAG_LINK_STATE => Message::LinkState(rest.to_vec()),
+            TAG_ROUTED => Message::Routed(rest.to_vec()),
             other => bail!("unknown message tag {other}"),
         })
     }
@@ -120,6 +130,8 @@ mod tests {
             Message::Pong(u64::MAX),
             Message::Data(b"hello mesh".to_vec()),
             Message::Data(vec![]),
+            Message::LinkState(vec![9; 40]),
+            Message::Routed(vec![8; 40]),
         ] {
             assert_eq!(Message::decode(&msg.encode()).unwrap(), msg);
         }

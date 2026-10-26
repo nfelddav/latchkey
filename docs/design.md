@@ -13,8 +13,11 @@ what it does and does not protect against.
   proven on every connection.
 - **Joining is not trusting.** Anyone may connect, but trust is an explicit, local decision.
 
-Non-goals for the MVP: multi-hop routing, Byzantine fault tolerance, NAT traversal, and
-hiding the existence of nodes from the local network.
+- **Never route through untrusted nodes.** Messages to distant nodes travel only through relays
+  the sender trusts, and relays cannot read them.
+
+Non-goals for the MVP: Byzantine fault tolerance, NAT traversal, hiding who talks to whom from
+relays, and hiding the existence of nodes from the local network.
 
 ## Identity
 
@@ -120,6 +123,8 @@ Encrypted message types, by tag byte:
 | 2 | Ping | u64 nonce |
 | 3 | Pong | u64 nonce |
 | 4 | Data | application bytes |
+| 5 | LinkState | a signed link-state advertisement (see Routing) |
+| 6 | Routed | a routed envelope (see Routing) |
 
 A link closes if its peer stops reading for 20 seconds, and `send` gives up after 10 seconds
 if the peer's outgoing queue stays full, so a stalled peer cannot hang the caller.
@@ -149,10 +154,15 @@ never disconnected.
   may belong to anyone.
 - **Trusted** means the peer's node ID is in your local `trusted` file.
 
-In the MVP, trust labels messages and peers in the CLI and API (`Event::Message.trusted`,
-`PeerInfo.trusted`), and untrusted peers can still exchange direct messages. Once multi-hop
-routing exists, the rule will be: **never route packets through a node you don't trust.** Full
-Byzantine resilience is a non-goal. Trusted nodes are assumed honest.
+Trust does two things:
+
+- It labels messages and peers in the CLI and API (`Event::Message.trusted`,
+  `PeerInfo.trusted`). Untrusted nodes can still exchange messages, directly or routed.
+- **A node never routes its messages through a node it doesn't trust.** Routes are chosen by
+  the sender, so this is the sender's trust that counts. The destination does not have to be
+  trusted.
+
+Full Byzantine resilience is a non-goal. Trusted nodes are assumed honest.
 
 Because those labels are all trust does today, a peer must not be able to fake them. The
 daemon escapes control characters and bidirectional-override characters in message text, so a
@@ -160,6 +170,84 @@ peer cannot forge extra output lines (such as a fake "trusted" message) or injec
 escape sequences.
 
 The allowlist is the first step. A PKI or delegated trust scheme may replace or extend it.
+
+## Routing
+
+### Link-state advertisements
+
+Every node floods a signed **link-state advertisement** (LSA):
+
+```
+version (1) | vk length (u16) | ML-DSA-65 vk | seq (u64) | key epoch (u64)
+  | X25519 public key (32) | ML-KEM-768 ek length (u16) | ek (1184)
+  | neighbor count (u16) | neighbor IDs (32 each) | ML-DSA-65 signature over "latchkey-v1 lsa" | body
+```
+
+- The origin is the hash of the verifying key that signed the LSA, so an LSA can't speak for
+  a node its sender doesn't control.
+- `seq` comes from the clock and always increases, so after a restart a node's new LSAs still
+  replace its old ones. A node keeps only the highest `seq` per origin.
+- A node advertises on start, when its neighbors change (after a 200 ms debounce), and every
+  30 seconds. It never advertises more than once a second. Receivers rate-limit each origin
+  with a token bucket (a burst of 4 newer LSAs, then 2 per second), which bounds how much
+  flooding one node can cause without dropping an honest node's updates that arrive close
+  together.
+- On receiving an LSA newer than the one it holds, a node stores it and forwards it to every
+  other neighbor. A new neighbor gets the node's whole topology at once.
+- LSAs not refreshed for 120 seconds expire. A node tracks at most 1024 origins; once full,
+  only trusted origins get in.
+
+### Choosing a route
+
+Routing uses **source routes**: the sender picks the whole path. It runs a breadth-first
+search over the topology and returns the shortest path where:
+
+- every relay is on the **sender's** allowlist (the destination need not be);
+- the first hop is one of the sender's live links;
+- every other link is listed by **both** of its ends, so one node cannot invent a link to
+  attract traffic;
+- there are at most 8 relays.
+
+Directly connected peers are always reached directly. `latchkey routes` and `Node::routes`
+show each known node and the route a message would take now.
+
+### Envelopes
+
+A routed message is an envelope sealed to the destination's advertised receiving keys:
+
+```
+version (1) | src (32) | dst (32) | hop (1) | relay count (1) | relays (32 each)
+  | key epoch (u64) | X25519 eph pub (32) | ML-KEM-768 ct (1088) | msg_id (16)
+  | ChaCha20-Poly1305( payload | ML-DSA-65 signature )
+```
+
+- The sender does an X25519 exchange between a fresh ephemeral key and the destination's
+  advertised X25519 key, and encapsulates to its advertised ML-KEM-768 key. Both secrets go
+  through HKDF-SHA3-256 into a one-time ChaCha20-Poly1305 key, as in the link handshake.
+- The AEAD's associated data covers every header field except `hop`, including the relay list,
+  so the destination knows exactly which relays carried the message. Relays only advance
+  `hop`.
+- Inside the ciphertext, the sender signs the associated data and payload with its identity
+  key. The destination checks the signature against the key in the sender's LSA. The receiver
+  learns who sent the message even though the link it arrived on belongs to a relay.
+- Receiving keys rotate every 5 minutes, and a node keeps the last 3 sets. Each LSA
+  advertises the current set. A message sealed to a discarded set can't be decrypted, and the
+  destination remembers delivered `msg_id`s for longer than that, so a captured envelope can
+  be delivered at most once.
+
+### Relaying
+
+A node that receives an envelope checks that it came from the previous node on the route (the
+sender itself for the first relay). If the envelope is addressed to it, it opens it. Otherwise
+it forwards the envelope only if it is the relay at position `hop`, increments `hop`, and hands
+it to the next node. Relays never wait on a congested next hop; they drop the message.
+
+By default a node relays for anyone, since the route was chosen by a sender that trusts it.
+With `relay_for = "trusted"` in `[routing]`, a node relays only envelopes handed to it by a
+peer it trusts.
+
+The maximum payload is the same whether a message is routed or not: a frame minus the largest
+envelope.
 
 ## Threat model
 
@@ -170,6 +258,8 @@ Protected against:
 - **Active network attackers impersonating a node.** That requires forging an ML-DSA-65
   signature for a key whose hash is the claimed node ID.
 - **Tampering, replay, and reordering** of session frames.
+- **Relays reading or forging routed messages.** Envelopes are sealed to the destination with
+  the same hybrid construction and signed by the sender.
 - **Forward secrecy.** Every connection uses fresh ephemeral keys, so a stolen identity key
   does not decrypt past sessions.
 
@@ -191,7 +281,15 @@ Not protected against, in the MVP:
   data directory is created with mode 0700, `identity.key` with mode 0600, and the node warns
   at startup if `identity.key` is readable by other users. The control socket is mode 0600, so
   other local users cannot drive the daemon.
-- **Malicious trusted nodes.** Trust is binary, and trusted nodes are assumed honest.
+- **Malicious trusted nodes.** Trust is binary, and trusted nodes are assumed honest. A trusted
+  relay can drop messages or advertise links it doesn't have.
+- **Traffic analysis.** Relays see the sender, the destination, the route, and message sizes.
+  LSAs reveal the mesh's shape to every node.
+- **Forward secrecy for routed messages is limited** to the 15-minute life of the receiving
+  keys, not per message. Someone who takes a node's memory can read routed messages sent to it
+  in that window.
+- **Untrusted nodes flooding LSAs.** Rate limits and the topology cap bound the damage, but an
+  attacker with many identities can fill the 1024 slots that untrusted origins share.
 
 ## Code map
 
@@ -202,7 +300,8 @@ Not protected against, in the MVP:
 | `wire` | Frame I/O and message encoding |
 | `display` | Escaping peer-supplied text for the terminal |
 | `discovery` | Multicast announce and listen |
-| `node` | Listener, dialing, peer table, connection tasks, public API |
+| `node` | Listener, dialing, peer table, connection tasks, flooding and relaying, public API |
+| `routing` | Link-state advertisements, topology and route selection, envelopes, receiving keys |
 | `trust` | The allowlist file |
 | `control` | Unix socket protocol between the CLI and the daemon |
 | `config` | `config.toml` |
