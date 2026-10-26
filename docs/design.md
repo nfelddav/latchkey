@@ -42,6 +42,9 @@ Discovery only accepts announcements that came from the local link:
   `0.0.0.0`, so the kernel delivers only datagrams addressed to the group. A host that can
   merely reach the UDP port with unicast, possibly with a spoofed source address, cannot inject
   announcements. Announcements are sent from a separate socket.
+- **No multicast route:** if the default interface cannot send to the IPv4 group (a host
+  with no network, or some CI and container setups), the node falls back to announcing over
+  loopback, so nodes on the same host still find each other, and logs a warning.
 - **IPv6:** announcements must come from a link-local (`fe80::/10`) source. Routers never
   forward packets with link-local sources, so nothing from off the link gets through.
 

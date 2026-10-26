@@ -57,11 +57,11 @@ pub fn spawn(
     let interval = Duration::from_secs(config.interval_secs.max(1));
     let port = config.port;
     match bind_v4(port) {
-        Ok((listen, send)) => {
+        Ok((listen, senders)) => {
             let target = SocketAddr::from((GROUP_V4, port));
             tokio::spawn(run(
                 listen,
-                send,
+                senders,
                 target,
                 id,
                 tcp_port,
@@ -77,7 +77,14 @@ pub fn spawn(
             Ok((listen, send)) => {
                 let target = SocketAddr::from((GROUP_V6, port));
                 tokio::spawn(run(
-                    listen, send, target, id, tcp_port, interval, found, shutdown,
+                    listen,
+                    vec![send],
+                    target,
+                    id,
+                    tcp_port,
+                    interval,
+                    found,
+                    shutdown,
                 ));
             }
             Err(e) => tracing::debug!("IPv6 multicast discovery unavailable: {e:#}"),
@@ -88,7 +95,7 @@ pub fn spawn(
 #[allow(clippy::too_many_arguments)]
 async fn run(
     listen: UdpSocket,
-    send: UdpSocket,
+    senders: Vec<UdpSocket>,
     target: SocketAddr,
     id: NodeId,
     tcp_port: u16,
@@ -104,14 +111,24 @@ async fn run(
         tokio::select! {
             _ = shutdown.changed() => return,
             _ = ticker.tick() => {
-                match send.send_to(&announcement, target).await {
-                    Ok(_) => tracing::trace!("announced to {target}"),
-                    Err(e) if !warned => {
-                        tracing::warn!("multicast announce to {target} failed: {e}");
-                        warned = true;
+                // Try each sender in order of preference; later ones are fallbacks.
+                for (i, send) in senders.iter().enumerate() {
+                    match send.send_to(&announcement, target).await {
+                        Ok(_) => {
+                            tracing::trace!("announced to {target} via sender {i}");
+                            break;
+                        }
+                        Err(e) if !warned => {
+                            tracing::warn!("multicast announce to {target} via sender {i} failed: {e}");
+                            if i + 1 < senders.len() {
+                                tracing::warn!("falling back to loopback: only nodes on this host will be discovered");
+                            }
+                            warned = true;
+                        }
+                        Err(_) => {}
                     }
-                    Err(_) => {}
                 }
+
             }
             received = listen.recv_from(&mut buf) => {
                 let Ok((len, from)) = received else { continue };
@@ -173,21 +190,37 @@ pub fn on_link_source(source: &IpAddr) -> bool {
     }
 }
 
-/// Returns (listening socket, sending socket).
-fn bind_v4(port: u16) -> Result<(UdpSocket, UdpSocket)> {
+/// Returns the listening socket and the sending sockets in order of preference: the default
+/// multicast interface, then loopback.
+///
+/// A host with no multicast route (no network, or some CI and container setups) cannot send
+/// to the group on its default interface. The loopback sender keeps discovery working between
+/// nodes on the same host in that case.
+fn bind_v4(port: u16) -> Result<(UdpSocket, Vec<UdpSocket>)> {
     let listen = shared_socket(Domain::IPV4)?;
     listen.bind(&listen_addr_v4(port).into())?;
-    listen.join_multicast_v4(&GROUP_V4, &Ipv4Addr::UNSPECIFIED)?;
+    let default_join = listen.join_multicast_v4(&GROUP_V4, &Ipv4Addr::UNSPECIFIED);
+    let loopback_join = listen.join_multicast_v4(&GROUP_V4, &Ipv4Addr::LOCALHOST);
+    if let (Err(e), Err(_)) = (&default_join, &loopback_join) {
+        anyhow::bail!("cannot join {GROUP_V4}: {e}");
+    }
 
-    let send = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
-    send.set_nonblocking(true)?;
-    send.bind(&SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)).into())?;
-    send.set_multicast_loop_v4(true)?;
-    send.set_multicast_ttl_v4(1)?;
-    Ok((
-        UdpSocket::from_std(listen.into())?,
-        UdpSocket::from_std(send.into())?,
-    ))
+    let sender = |interface: Option<Ipv4Addr>| -> Result<UdpSocket> {
+        let send = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
+        send.set_nonblocking(true)?;
+        send.bind(&SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)).into())?;
+        send.set_multicast_loop_v4(true)?;
+        send.set_multicast_ttl_v4(1)?;
+        if let Some(interface) = interface {
+            send.set_multicast_if_v4(&interface)?;
+        }
+        Ok(UdpSocket::from_std(send.into())?)
+    };
+    let mut senders = vec![sender(None)?];
+    if let Ok(loopback) = sender(Some(Ipv4Addr::LOCALHOST)) {
+        senders.push(loopback);
+    }
+    Ok((UdpSocket::from_std(listen.into())?, senders))
 }
 
 /// Returns (listening socket, sending socket).
@@ -247,7 +280,7 @@ mod tests {
     #[tokio::test]
     async fn ignores_unicast_announcements() {
         let port = 30000 + (std::process::id() % 20000) as u16;
-        let (listen, _send) = bind_v4(port).unwrap();
+        let (listen, _senders) = bind_v4(port).unwrap();
         let sender = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         sender
             .send_to(
