@@ -41,6 +41,8 @@ enum Command {
     Id,
     /// List connected peers.
     Peers,
+    /// List every node known from the mesh and the relays a message to it would use.
+    Routes,
     /// Measure the round-trip time to a peer.
     Ping { peer: String },
     /// Send a text message to a peer.
@@ -133,10 +135,16 @@ async fn run(config: Config) -> Result<()> {
                     from,
                     trusted,
                     data,
+                    via,
                 }) => {
                     let label = if trusted { "trusted" } else { "untrusted" };
+                    let route = match via.len() {
+                        0 => String::new(),
+                        1 => " via 1 relay".to_string(),
+                        n => format!(" via {n} relays"),
+                    };
                     println!(
-                        "[{} {label}] {}",
+                        "[{} {label}{route}] {}",
                         from.short(),
                         latchkey::display::printable(&data)
                     );
@@ -189,6 +197,7 @@ async fn client(config: &Config, command: Command) -> Result<()> {
     let path = config.control_path();
     let req = match command {
         Command::Peers => Request::Peers,
+        Command::Routes => Request::Routes,
         Command::Ping { peer } => Request::Ping { peer },
         Command::Send { peer, text } => Request::Send {
             peer,
@@ -289,6 +298,27 @@ fn print_result(req: &latchkey::control::Request, result: &Value) {
                 );
             }
         }
+        Request::Routes => {
+            let routes = result.as_array().cloned().unwrap_or_default();
+            if routes.is_empty() {
+                println!("no nodes known beyond direct peers");
+            }
+            for r in routes {
+                let via = match r["via"].as_array() {
+                    None => "no trusted route".to_string(),
+                    Some(relays) if relays.is_empty() => "direct".to_string(),
+                    Some(relays) => format!(
+                        "via {}",
+                        relays.iter().map(short).collect::<Vec<_>>().join(" > ")
+                    ),
+                };
+                println!(
+                    "{}  {:<9}  {via}",
+                    short(&r["id"]),
+                    trust_label(&r["trusted"])
+                );
+            }
+        }
         Request::Ping { .. } => {
             println!(
                 "{}: {:.2} ms",
@@ -297,8 +327,17 @@ fn print_result(req: &latchkey::control::Request, result: &Value) {
             );
         }
         Request::Send { .. } => {
+            let relays = result["via"].as_array().cloned().unwrap_or_default();
+            let route = if relays.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    " via {}",
+                    relays.iter().map(short).collect::<Vec<_>>().join(" > ")
+                )
+            };
             println!(
-                "sent to {} ({})",
+                "sent to {} ({}){route}",
                 short(&result["id"]),
                 trust_label(&result["trusted"])
             );

@@ -20,6 +20,7 @@ use crate::node::Node;
 pub enum Request {
     Status,
     Peers,
+    Routes,
     Ping { peer: String },
     Send { peer: String, text: String },
     Connect { addr: String },
@@ -103,6 +104,7 @@ async fn execute(node: &Node, request: Request) -> Result<Value> {
             "peers": node.peers().len(),
         }),
         Request::Peers => serde_json::to_value(node.peers())?,
+        Request::Routes => serde_json::to_value(node.routes())?,
         Request::Ping { peer } => {
             let id = node.resolve(&peer)?;
             let rtt = node.ping(&id).await?;
@@ -110,8 +112,8 @@ async fn execute(node: &Node, request: Request) -> Result<Value> {
         }
         Request::Send { peer, text } => {
             let id = node.resolve(&peer)?;
-            node.send(&id, text.into_bytes()).await?;
-            json!({ "id": id, "trusted": node.is_trusted(&id) })
+            let via = node.send(&id, text.into_bytes()).await?;
+            json!({ "id": id, "trusted": node.is_trusted(&id), "via": via })
         }
         Request::Connect { addr } => {
             let addr = tokio::net::lookup_host(addr.as_str())
@@ -191,6 +193,7 @@ mod tests {
                 enabled: false,
                 ..Default::default()
             },
+            routing: Default::default(),
         };
         let a = Node::start(config("a")).await.unwrap();
         let b = Node::start(config("b")).await.unwrap();

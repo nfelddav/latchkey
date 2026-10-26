@@ -22,6 +22,25 @@ pub struct Config {
     /// cannot reach, such as ones on another subnet or across a VPN.
     pub peers: Vec<String>,
     pub discovery: DiscoveryConfig,
+    pub routing: RoutingConfig,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RoutingConfig {
+    /// Whose routed traffic this node forwards as a relay. Which relays a node *uses* for
+    /// its own traffic is always limited to the nodes it trusts.
+    pub relay_for: RelayPolicy,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RelayPolicy {
+    /// Forward for any sender, within the node's queue limits.
+    #[default]
+    Anyone,
+    /// Forward only envelopes handed over by a node on this node's allowlist.
+    Trusted,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -44,6 +63,7 @@ impl Default for Config {
             listen: SocketAddr::from(([0, 0, 0, 0], DEFAULT_PORT)),
             peers: Vec::new(),
             discovery: DiscoveryConfig::default(),
+            routing: RoutingConfig::default(),
         }
     }
 }
@@ -116,6 +136,8 @@ mod tests {
             [discovery]
             enabled = false
             port = 9001
+            [routing]
+            relay_for = "trusted"
             "#,
         )
         .unwrap();
@@ -124,6 +146,7 @@ mod tests {
         assert!(!config.discovery.enabled);
         assert_eq!(config.discovery.port, 9001);
         assert!(config.discovery.ipv6, "unset fields keep their defaults");
+        assert_eq!(config.routing.relay_for, RelayPolicy::Trusted);
     }
 
     #[test]

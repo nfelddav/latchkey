@@ -9,12 +9,16 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{Semaphore, broadcast, mpsc, oneshot, watch};
+use tokio::sync::{Notify, Semaphore, broadcast, mpsc, oneshot, watch};
 
-use crate::config::Config;
+use crate::config::{Config, RelayPolicy};
 use crate::discovery::{self, Sighting};
 use crate::handshake::{Established, Role, handshake};
 use crate::identity::{Identity, NodeId};
+use crate::routing::{
+    self, ENVELOPE_OVERHEAD, Envelope, KeyRing, LSA_MIN_INTERVAL, LSA_REFRESH, LinkState,
+    ReplayGuard, Topology,
+};
 use crate::trust::TrustStore;
 use crate::wire::{MAX_FRAME, Message, read_frame, write_frame};
 
@@ -38,8 +42,15 @@ const MAX_DIALS: usize = 16;
 const MAX_INBOUND_HANDSHAKES: usize = 32;
 /// Connected peers. New peers beyond this are refused.
 pub const MAX_PEERS: usize = 256;
-/// Largest payload `send` accepts: a frame minus the AEAD tag and message tag.
-pub const MAX_MESSAGE: usize = MAX_FRAME - 16 - 1;
+/// Largest payload `send` accepts: a frame minus the link's AEAD tag, the message tag, and
+/// the overhead of a routed envelope, so the same limit holds whether or not a message is
+/// routed.
+pub const MAX_MESSAGE: usize = MAX_FRAME - 16 - 1 - ENVELOPE_OVERHEAD;
+/// Delay before re-advertising after the neighbor set changes, so a burst of changes produces
+/// one advertisement.
+const LSA_DEBOUNCE: Duration = Duration::from_millis(200);
+/// How long a new peer's topology sync may wait on its queue before it is abandoned.
+const SYNC_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Something that happened on the node.
 #[derive(Debug, Clone)]
@@ -52,13 +63,25 @@ pub enum Event {
     PeerDisconnected {
         id: NodeId,
     },
-    /// A direct message from a connected peer. `trusted` says whether the sender is on the
-    /// allowlist; the sender's identity is always authenticated either way.
+    /// A message for this node. `trusted` says whether the sender is on the allowlist; the
+    /// sender's identity is always authenticated either way, end to end when routed. `via`
+    /// lists the relays it came through, and is empty for a direct message.
     Message {
         from: NodeId,
         trusted: bool,
         data: Vec<u8>,
+        via: Vec<NodeId>,
     },
+}
+
+/// A node known from the mesh's link-state advertisements.
+#[derive(Debug, Clone, Serialize)]
+pub struct RouteInfo {
+    pub id: NodeId,
+    pub trusted: bool,
+    /// The relays a message to this node would go through right now: empty for a direct
+    /// peer, `None` if there is no route through trusted relays.
+    pub via: Option<Vec<NodeId>>,
 }
 
 /// A snapshot of one connected peer.
@@ -92,6 +115,15 @@ struct Inner {
     events: broadcast::Sender<Event>,
     shutdown: watch::Sender<bool>,
     next_conn: AtomicU64,
+    relay_policy: RelayPolicy,
+    topology: Mutex<Topology>,
+    keys: Mutex<KeyRing>,
+    replay: Mutex<ReplayGuard>,
+    /// Our latest signed advertisement, sent to each new peer.
+    own_lsa: Mutex<Option<Vec<u8>>>,
+    lsa_seq: AtomicU64,
+    /// Signalled when our neighbor set changes and we should re-advertise.
+    neighbors_changed: Notify,
 }
 
 /// Whether a new link to a peer should replace the existing one. Links are described by
@@ -157,11 +189,20 @@ impl Node {
                 events: broadcast::channel(256).0,
                 shutdown,
                 next_conn: AtomicU64::new(0),
+                relay_policy: config.routing.relay_for,
+                topology: Mutex::default(),
+                keys: Mutex::default(),
+                replay: Mutex::default(),
+                own_lsa: Mutex::default(),
+                // Start from the clock so advertisements after a restart still count as newer.
+                lsa_seq: AtomicU64::new(routing::unix_millis()),
+                neighbors_changed: Notify::new(),
             }),
         };
         tracing::info!("node {} listening on {local_addr}", node.id());
 
         tokio::spawn(node.clone().accept_loop(listener));
+        tokio::spawn(node.clone().advertise_loop());
 
         if config.discovery.enabled {
             if local_addr.ip().is_loopback() {
@@ -248,13 +289,15 @@ impl Node {
         }
         let mut known: HashSet<NodeId> = self.inner.peers.lock().unwrap().keys().copied().collect();
         known.extend(self.trusted());
+        known.extend(self.inner.topology.lock().unwrap().ids().copied());
+        known.remove(&self.id());
         let matches: Vec<NodeId> = known
             .into_iter()
             .filter(|id| id.to_string().starts_with(&query))
             .collect();
         match matches.as_slice() {
             [id] => Ok(*id),
-            [] => bail!("no connected or trusted node matches {query:?}"),
+            [] => bail!("no known node matches {query:?}"),
             _ => bail!(
                 "{query:?} matches {} nodes; use a longer prefix",
                 matches.len()
@@ -271,16 +314,67 @@ impl Node {
         self.clone().establish(stream, addr, Role::Initiator).await
     }
 
-    /// Send a direct message to a connected peer.
-    pub async fn send(&self, peer: &NodeId, data: Vec<u8>) -> Result<()> {
+    /// Send a message to `peer`: directly if connected, otherwise along the shortest route
+    /// whose relays are all trusted. Returns the relays used (empty for a direct send).
+    pub async fn send(&self, peer: &NodeId, data: Vec<u8>) -> Result<Vec<NodeId>> {
         if data.len() > MAX_MESSAGE {
             bail!(
                 "message is {} bytes; the limit is {MAX_MESSAGE}",
                 data.len()
             );
         }
-        let tx = self.sender(peer)?;
-        tokio::time::timeout(SEND_TIMEOUT, tx.send(Message::Data(data)))
+        if let Ok(tx) = self.sender(peer) {
+            self.push(&tx, Message::Data(data)).await?;
+            return Ok(Vec::new());
+        }
+
+        let path = self
+            .route(peer)
+            .with_context(|| format!("no route to {} through trusted relays", peer.short()))?;
+        let dst = self
+            .inner
+            .topology
+            .lock()
+            .unwrap()
+            .get(peer)
+            .cloned()
+            .context("destination left the topology")?;
+        let envelope = Envelope::seal(&self.inner.identity, &dst, path.clone(), &data)?;
+        let tx = self.sender(&envelope.next_hop())?;
+        self.push(&tx, Message::Routed(envelope.encode())).await?;
+        Ok(path)
+    }
+
+    /// The relays a message to `peer` would use now: empty if directly connected, `None` if
+    /// no route passes only through trusted relays.
+    pub fn route(&self, peer: &NodeId) -> Option<Vec<NodeId>> {
+        let direct: HashSet<NodeId> = self.inner.peers.lock().unwrap().keys().copied().collect();
+        let trusted: HashSet<NodeId> = self.trusted().into_iter().collect();
+        self.inner
+            .topology
+            .lock()
+            .unwrap()
+            .route(self.id(), &direct, *peer, |n| trusted.contains(n))
+    }
+
+    /// Every node known from the mesh, with how a message would reach it.
+    pub fn routes(&self) -> Vec<RouteInfo> {
+        let ids: Vec<NodeId> = self.inner.topology.lock().unwrap().ids().copied().collect();
+        let mut routes: Vec<RouteInfo> = ids
+            .into_iter()
+            .filter(|id| *id != self.id())
+            .map(|id| RouteInfo {
+                id,
+                trusted: self.is_trusted(&id),
+                via: self.route(&id),
+            })
+            .collect();
+        routes.sort_by_key(|r| r.id);
+        routes
+    }
+
+    async fn push(&self, tx: &mpsc::Sender<Message>, msg: Message) -> Result<()> {
+        tokio::time::timeout(SEND_TIMEOUT, tx.send(msg))
             .await
             .context("peer is not reading; send timed out")?
             .map_err(|_| anyhow::anyhow!("peer disconnected"))
@@ -467,7 +561,10 @@ impl Node {
             _close: close_tx,
         };
         match self.register(peer, new) {
-            Registration::New => {}
+            Registration::New => {
+                self.inner.neighbors_changed.notify_one();
+                tokio::spawn(self.clone().sync_topology(tx.clone()));
+            }
             Registration::Replaced => {
                 tracing::debug!("replaced link to {} with one from {addr}", peer.short());
                 tokio::spawn(self.run_connection(stream, peer, conn, send, recv, tx, rx, close_rx));
@@ -576,7 +673,14 @@ impl Node {
                             from: peer,
                             trusted,
                             data,
+                            via: Vec::new(),
                         });
+                    }
+                    Message::LinkState(bytes) => self.handle_link_state(peer, bytes),
+                    Message::Routed(bytes) => {
+                        if let Err(e) = self.handle_routed(peer, &bytes) {
+                            tracing::debug!("dropped routed message from {}: {e:#}", peer.short());
+                        }
                     }
                     Message::Auth { .. } => bail!("unexpected auth message"),
                 }
@@ -603,9 +707,173 @@ impl Node {
             }
         };
         if removed {
+            self.inner.neighbors_changed.notify_one();
             tracing::info!("disconnected from {}", peer.short());
             self.emit(Event::PeerDisconnected { id: peer });
         }
+    }
+
+    /// Advertise our link state: on start, whenever our neighbors change, and every
+    /// [`LSA_REFRESH`] so others don't expire us.
+    async fn advertise_loop(self) {
+        let mut shutdown = self.inner.shutdown.subscribe();
+        let mut last = Instant::now() - LSA_MIN_INTERVAL;
+        loop {
+            let wait = LSA_MIN_INTERVAL.saturating_sub(last.elapsed());
+            tokio::time::sleep(wait).await;
+            last = Instant::now();
+            if let Err(e) = self.advertise() {
+                tracing::warn!("cannot sign link state: {e:#}");
+            }
+            self.inner.topology.lock().unwrap().expire();
+            tokio::select! {
+                _ = shutdown.changed() => return,
+                _ = tokio::time::sleep(LSA_REFRESH) => {}
+                _ = self.inner.neighbors_changed.notified() => {
+                    tokio::time::sleep(LSA_DEBOUNCE).await;
+                }
+            }
+        }
+    }
+
+    /// Sign a fresh advertisement of our current neighbors and send it to all of them.
+    fn advertise(&self) -> Result<()> {
+        let (neighbors, senders): (Vec<NodeId>, Vec<mpsc::Sender<Message>>) = self
+            .inner
+            .peers
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(id, p)| (*id, p.tx.clone()))
+            .unzip();
+        // Sequence numbers come from the clock so they keep increasing across restarts.
+        let seq = routing::unix_millis().max(self.inner.lsa_seq.load(Ordering::Relaxed) + 1);
+        self.inner.lsa_seq.store(seq, Ordering::Relaxed);
+        let state = {
+            let mut keys = self.inner.keys.lock().unwrap();
+            LinkState::sign(&self.inner.identity, seq, keys.current(), &neighbors)?
+        };
+        *self.inner.own_lsa.lock().unwrap() = Some(state.encoded.clone());
+        for tx in senders {
+            let _ = tx.try_send(Message::LinkState(state.encoded.clone()));
+        }
+        Ok(())
+    }
+
+    /// Give a new peer everything we know about the mesh, so it can route right away instead
+    /// of waiting for the next refresh.
+    async fn sync_topology(self, tx: mpsc::Sender<Message>) {
+        let mut states: Vec<Vec<u8>> = self.inner.own_lsa.lock().unwrap().iter().cloned().collect();
+        states.extend(
+            self.inner
+                .topology
+                .lock()
+                .unwrap()
+                .states()
+                .map(|s| s.encoded.clone()),
+        );
+        let _ = tokio::time::timeout(SYNC_TIMEOUT, async {
+            for state in states {
+                if tx.send(Message::LinkState(state)).await.is_err() {
+                    return;
+                }
+            }
+        })
+        .await;
+    }
+
+    /// Verify an advertisement from `from`, store it if it is new, and flood it to our other
+    /// neighbors.
+    fn handle_link_state(&self, from: NodeId, bytes: Vec<u8>) {
+        let state = match LinkState::verify(&bytes) {
+            Ok(state) => state,
+            Err(e) => {
+                tracing::debug!("bad link state from {}: {e:#}", from.short());
+                return;
+            }
+        };
+        let origin = state.origin;
+        if origin == self.id() {
+            return;
+        }
+        let trusted = self.is_trusted(&origin);
+        if !self.inner.topology.lock().unwrap().insert(state, trusted) {
+            return;
+        }
+        tracing::trace!("link state from {} via {}", origin.short(), from.short());
+        let senders: Vec<mpsc::Sender<Message>> = self
+            .inner
+            .peers
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(id, _)| **id != from && **id != origin)
+            .map(|(_, p)| p.tx.clone())
+            .collect();
+        for tx in senders {
+            // Flooding is best effort; a peer with a full queue catches up on the next refresh.
+            let _ = tx.try_send(Message::LinkState(bytes.clone()));
+        }
+    }
+
+    /// Deliver a routed envelope addressed to us, or forward it one hop if we are the relay
+    /// its route names next.
+    fn handle_routed(&self, from: NodeId, bytes: &[u8]) -> Result<()> {
+        let mut envelope = Envelope::decode(bytes)?;
+        let hop = envelope.hop as usize;
+        // Whoever handed us the envelope must be the node before us on its route.
+        let expected_from = match hop {
+            0 => envelope.src,
+            _ => envelope.path[hop - 1],
+        };
+        if from != expected_from {
+            bail!("came from {}, not the previous hop", from.short());
+        }
+
+        if envelope.dst == self.id() {
+            if hop != envelope.path.len() {
+                bail!("delivered before the end of its route");
+            }
+            let sender = self
+                .inner
+                .topology
+                .lock()
+                .unwrap()
+                .get(&envelope.src)
+                .cloned()
+                .context("sender's link state is unknown")?;
+            let data = envelope.open(&self.inner.keys.lock().unwrap(), &sender)?;
+            if !self.inner.replay.lock().unwrap().check(envelope.msg_id()) {
+                bail!("replayed message");
+            }
+            self.emit(Event::Message {
+                from: envelope.src,
+                trusted: self.is_trusted(&envelope.src),
+                data,
+                via: envelope.path,
+            });
+            return Ok(());
+        }
+
+        if envelope.path.get(hop) != Some(&self.id()) {
+            bail!("we are not the next relay on its route");
+        }
+        if self.inner.relay_policy == RelayPolicy::Trusted && !self.is_trusted(&from) {
+            bail!("relaying only for trusted peers");
+        }
+        envelope.hop += 1;
+        let next = envelope.next_hop();
+        let tx = self.sender(&next)?;
+        // Relays never block: a full queue drops the message, like a congested router.
+        tx.try_send(Message::Routed(envelope.encode()))
+            .map_err(|_| anyhow::anyhow!("next hop {} is congested", next.short()))?;
+        tracing::trace!(
+            "relayed {} -> {} to {}",
+            envelope.src.short(),
+            envelope.dst.short(),
+            next.short()
+        );
+        Ok(())
     }
 }
 
