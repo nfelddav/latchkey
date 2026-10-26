@@ -104,18 +104,26 @@ async fn run(
         tokio::select! {
             _ = shutdown.changed() => return,
             _ = ticker.tick() => {
-                if let Err(e) = send.send_to(&announcement, target).await
-                    && !warned {
+                match send.send_to(&announcement, target).await {
+                    Ok(_) => tracing::trace!("announced to {target}"),
+                    Err(e) if !warned => {
                         tracing::warn!("multicast announce to {target} failed: {e}");
                         warned = true;
                     }
+                    Err(_) => {}
+                }
             }
             received = listen.recv_from(&mut buf) => {
                 let Ok((len, from)) = received else { continue };
                 let Some((peer, port)) = decode_announce(&buf[..len]) else { continue };
-                if peer == id || !on_link_source(&from.ip()) {
+                if peer == id {
                     continue;
                 }
+                if !on_link_source(&from.ip()) {
+                    tracing::debug!("ignoring announcement from off-link source {from}");
+                    continue;
+                }
+                tracing::trace!("announcement from {} at {from}", peer.short());
                 let addr = SocketAddr::new(from.ip(), port);
                 let addr = match (addr, from) {
                     (SocketAddr::V6(mut v6), SocketAddr::V6(src)) => {

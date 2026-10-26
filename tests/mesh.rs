@@ -218,6 +218,11 @@ async fn resolve_accepts_unique_prefixes() {
 /// multicast. Needs a network interface that loops multicast back to the host.
 #[tokio::test]
 async fn multicast_discovery_connects_nodes() {
+    // Discovery depends on the host's network setup; log it so a CI failure explains itself.
+    let _ = tracing_subscriber::fmt()
+        .with_test_writer()
+        .with_env_filter("latchkey=trace")
+        .try_init();
     let port = 40000 + (std::process::id() % 20000) as u16;
     let discovery = DiscoveryConfig {
         enabled: true,
