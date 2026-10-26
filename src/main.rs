@@ -138,7 +138,7 @@ async fn run(config: Config) -> Result<()> {
                     println!(
                         "[{} {label}] {}",
                         from.short(),
-                        String::from_utf8_lossy(&data)
+                        latchkey::display::printable(&data)
                     );
                 }
                 Ok(_) => {}

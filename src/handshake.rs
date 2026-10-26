@@ -57,6 +57,8 @@ impl Role {
 /// The outcome of a successful handshake.
 pub struct Established {
     pub peer: NodeId,
+    /// The transcript hash, unique to this session and known to both sides.
+    pub session: [u8; 32],
     pub send: SendCipher,
     pub recv: RecvCipher,
 }
@@ -82,12 +84,7 @@ where
                 .decapsulate_slice(ct)
                 .map_err(|_| anyhow::anyhow!("bad ML-KEM ciphertext"))?;
             let x_peer = x_peer.to_vec();
-            (
-                hello_i,
-                hello_r,
-                x_peer,
-                Zeroizing::new(kem_secret.to_vec()),
-            )
+            (hello_i, hello_r, x_peer, Zeroizing::new(kem_secret))
         }
         Role::Responder => {
             let hello_i = read_frame(stream).await?;
@@ -99,12 +96,7 @@ where
             let hello_r = [&MAGIC[..], x_public.as_bytes(), &ct[..]].concat();
             write_frame(stream, &hello_r).await?;
             let x_peer = x_peer.to_vec();
-            (
-                hello_i,
-                hello_r,
-                x_peer,
-                Zeroizing::new(kem_secret.to_vec()),
-            )
+            (hello_i, hello_r, x_peer, Zeroizing::new(kem_secret))
         }
     };
 
@@ -122,7 +114,7 @@ where
         .finalize()
         .into();
 
-    let ikm = Zeroizing::new([x_shared.as_bytes().as_slice(), &kem_secret].concat());
+    let ikm = Zeroizing::new([x_shared.as_bytes().as_slice(), kem_secret.as_slice()].concat());
     let hkdf = SimpleHkdf::<Sha3_256>::new(Some(&transcript), &ikm);
     let mut i2r = Zeroizing::new([0u8; 32]);
     let mut r2i = Zeroizing::new([0u8; 32]);
@@ -139,7 +131,7 @@ where
 
     let auth = Message::Auth {
         verifying_key: identity.verifying_key_bytes(),
-        signature: identity.sign(&auth_payload(&transcript, role)),
+        signature: identity.sign(&auth_payload(&transcript, role))?,
     };
     write_frame(stream, &send.seal(&auth.encode())?).await?;
 
@@ -158,7 +150,12 @@ where
     )
     .context("peer failed to authenticate")?;
 
-    Ok(Established { peer, send, recv })
+    Ok(Established {
+        peer,
+        session: transcript,
+        send,
+        recv,
+    })
 }
 
 fn auth_payload(transcript: &[u8; 32], signer: Role) -> Vec<u8> {

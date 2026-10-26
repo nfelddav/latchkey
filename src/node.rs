@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{broadcast, mpsc, oneshot, watch};
+use tokio::sync::{Semaphore, broadcast, mpsc, oneshot, watch};
 
 use crate::config::Config;
 use crate::discovery::{self, Sighting};
@@ -25,6 +25,19 @@ const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
 /// A link with no incoming frames for this long is considered dead.
 const IDLE_TIMEOUT: Duration = Duration::from_secs(45);
 const STATIC_PEER_RETRY: Duration = Duration::from_secs(15);
+/// How long `send` waits for room in a peer's queue before giving up.
+const SEND_TIMEOUT: Duration = Duration::from_secs(10);
+/// A link whose peer stops reading for this long is closed.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(20);
+/// Two links to the same peer that both formed within this window are treated as a race;
+/// outside it, the newer link replaces the older, which is likely stale.
+const RACE_WINDOW: Duration = Duration::from_secs(10);
+/// Background dials (discovery and static peers) in flight at once.
+const MAX_DIALS: usize = 16;
+/// Inbound handshakes in progress at once. Extra connections are closed immediately.
+const MAX_INBOUND_HANDSHAKES: usize = 32;
+/// Connected peers. New peers beyond this are refused.
+pub const MAX_PEERS: usize = 256;
 /// Largest payload `send` accepts: a frame minus the AEAD tag and message tag.
 pub const MAX_MESSAGE: usize = MAX_FRAME - 16 - 1;
 
@@ -71,8 +84,8 @@ struct Inner {
     trust: Mutex<TrustStore>,
     peers: Mutex<HashMap<NodeId, Peer>>,
     dialing: Mutex<HashSet<SocketAddr>>,
-    /// Discovered nodes we are dialing, so IPv4 and IPv6 sightings don't race each other.
-    dialing_ids: Mutex<HashSet<NodeId>>,
+    dial_slots: Arc<Semaphore>,
+    handshake_slots: Arc<Semaphore>,
     pings: Mutex<HashMap<u64, oneshot::Sender<()>>>,
     /// Node ID last seen at each static peer address, so we do not redial a connected peer.
     static_ids: Mutex<HashMap<SocketAddr, NodeId>>,
@@ -81,9 +94,37 @@ struct Inner {
     next_conn: AtomicU64,
 }
 
+/// Whether a new link to a peer should replace the existing one. Links are described by
+/// (initiator, session hash), which both ends know, so both ends reach the same answer.
+fn prefer_new_link(
+    lower_id: NodeId,
+    existing: (NodeId, [u8; 32]),
+    new: (NodeId, [u8; 32]),
+    existing_age: Duration,
+) -> bool {
+    if existing_age >= RACE_WINDOW {
+        true
+    } else if existing.0 != new.0 {
+        new.0 == lower_id
+    } else {
+        new.1 < existing.1
+    }
+}
+
+enum Registration {
+    New,
+    /// Replaced an existing link to the same peer; the peer was already connected.
+    Replaced,
+    /// An existing link to the same peer wins; the new one is dropped.
+    Duplicate,
+    Full,
+}
+
 struct Peer {
     addr: SocketAddr,
     initiator: NodeId,
+    /// The handshake transcript hash, which both ends of the link agree on.
+    session: [u8; 32],
     conn: u64,
     tx: mpsc::Sender<Message>,
     since: Instant,
@@ -109,7 +150,8 @@ impl Node {
                 trust: Mutex::new(trust),
                 peers: Mutex::default(),
                 dialing: Mutex::default(),
-                dialing_ids: Mutex::default(),
+                dial_slots: Arc::new(Semaphore::new(MAX_DIALS)),
+                handshake_slots: Arc::new(Semaphore::new(MAX_INBOUND_HANDSHAKES)),
                 pings: Mutex::default(),
                 static_ids: Mutex::default(),
                 events: broadcast::channel(256).0,
@@ -238,8 +280,9 @@ impl Node {
             );
         }
         let tx = self.sender(peer)?;
-        tx.send(Message::Data(data))
+        tokio::time::timeout(SEND_TIMEOUT, tx.send(Message::Data(data)))
             .await
+            .context("peer is not reading; send timed out")?
             .map_err(|_| anyhow::anyhow!("peer disconnected"))
     }
 
@@ -255,16 +298,15 @@ impl Node {
         let (done_tx, done_rx) = oneshot::channel();
         self.inner.pings.lock().unwrap().insert(nonce, done_tx);
         let start = Instant::now();
-        let result = async {
+        let result = tokio::time::timeout(PING_TIMEOUT, async {
             tx.send(Message::Ping(nonce))
                 .await
                 .map_err(|_| anyhow::anyhow!("peer disconnected"))?;
-            tokio::time::timeout(PING_TIMEOUT, done_rx)
-                .await
-                .context("ping timed out")?
-                .context("peer disconnected")
-        }
-        .await;
+            done_rx.await.context("peer disconnected")
+        })
+        .await
+        .context("ping timed out")
+        .and_then(|r| r);
         self.inner.pings.lock().unwrap().remove(&nonce);
         result.map(|()| start.elapsed())
     }
@@ -292,9 +334,15 @@ impl Node {
                 _ = shutdown.changed() => return,
                 accepted = listener.accept() => match accepted {
                     Ok((stream, addr)) => {
+                        let Ok(permit) = self.inner.handshake_slots.clone().try_acquire_owned() else {
+                            tracing::debug!("too many handshakes in progress; dropping {addr}");
+                            continue;
+                        };
                         let node = self.clone();
                         tokio::spawn(async move {
-                            if let Err(e) = node.establish(stream, addr, Role::Responder).await {
+                            let result = node.establish(stream, addr, Role::Responder).await;
+                            drop(permit);
+                            if let Err(e) = result {
                                 tracing::debug!("inbound connection from {addr} failed: {e:#}");
                             }
                         });
@@ -311,9 +359,6 @@ impl Node {
     async fn discovery_loop(self, mut found: mpsc::Receiver<Sighting>) {
         while let Some(Sighting { id, addr }) = found.recv().await {
             if !discovery::dialable(&addr) || self.inner.peers.lock().unwrap().contains_key(&id) {
-                continue;
-            }
-            if !self.inner.dialing_ids.lock().unwrap().insert(id) {
                 continue;
             }
             tracing::debug!("discovered {} at {addr}", id.short());
@@ -349,27 +394,36 @@ impl Node {
         }
     }
 
-    /// Dial `addr` in the background. `discovered` is the node ID a multicast announcement
-    /// claimed, released from `dialing_ids` once the attempt ends.
-    fn spawn_dial(&self, addr: SocketAddr, discovered: Option<NodeId>) {
+    /// Dial `addr` in the background, at most once per address at a time. `announced` is the
+    /// node ID a multicast announcement claimed, which is only a hint: the handshake decides
+    /// who is really there.
+    fn spawn_dial(&self, addr: SocketAddr, announced: Option<NodeId>) {
+        let Ok(permit) = self.inner.dial_slots.clone().try_acquire_owned() else {
+            tracing::debug!("too many dials in flight; skipping {addr}");
+            return;
+        };
         if !self.inner.dialing.lock().unwrap().insert(addr) {
-            if let Some(id) = discovered {
-                self.inner.dialing_ids.lock().unwrap().remove(&id);
-            }
             return;
         }
         let node = self.clone();
         tokio::spawn(async move {
             match node.connect(addr).await {
                 Ok(id) => {
-                    node.inner.static_ids.lock().unwrap().insert(addr, id);
+                    if announced.is_some_and(|claimed| claimed != id) {
+                        tracing::warn!(
+                            "{addr} announced itself as {} but authenticated as {}",
+                            announced.unwrap().short(),
+                            id.short()
+                        );
+                    }
+                    if announced.is_none() {
+                        node.inner.static_ids.lock().unwrap().insert(addr, id);
+                    }
                 }
                 Err(e) => tracing::debug!("dial {addr} failed: {e:#}"),
             }
             node.inner.dialing.lock().unwrap().remove(&addr);
-            if let Some(id) = discovered {
-                node.inner.dialing_ids.lock().unwrap().remove(&id);
-            }
+            drop(permit);
         });
     }
 
@@ -381,7 +435,12 @@ impl Node {
         role: Role,
     ) -> Result<NodeId> {
         stream.set_nodelay(true)?;
-        let Established { peer, send, recv } = tokio::time::timeout(
+        let Established {
+            peer,
+            session,
+            send,
+            recv,
+        } = tokio::time::timeout(
             HANDSHAKE_TIMEOUT,
             handshake(&mut stream, &self.inner.identity, role),
         )
@@ -398,19 +457,25 @@ impl Node {
         let (tx, rx) = mpsc::channel(64);
         let conn = self.inner.next_conn.fetch_add(1, Ordering::Relaxed);
         let (close_tx, close_rx) = oneshot::channel();
-        if !self.register(
-            peer,
-            Peer {
-                addr,
-                initiator,
-                conn,
-                tx: tx.clone(),
-                since: Instant::now(),
-                _close: close_tx,
-            },
-        ) {
-            // Keeping the existing duplicate. Report success: the peer is connected.
-            return Ok(peer);
+        let new = Peer {
+            addr,
+            initiator,
+            session,
+            conn,
+            tx: tx.clone(),
+            since: Instant::now(),
+            _close: close_tx,
+        };
+        match self.register(peer, new) {
+            Registration::New => {}
+            Registration::Replaced => {
+                tracing::debug!("replaced link to {} with one from {addr}", peer.short());
+                tokio::spawn(self.run_connection(stream, peer, conn, send, recv, tx, rx, close_rx));
+                return Ok(peer);
+            }
+            // Keeping the existing link. Report success: the peer is connected.
+            Registration::Duplicate => return Ok(peer),
+            Registration::Full => bail!("peer limit of {MAX_PEERS} reached"),
         }
         let trusted = self.is_trusted(&peer);
         tracing::info!(
@@ -427,20 +492,33 @@ impl Node {
         Ok(peer)
     }
 
-    /// Add the peer to the table. When two connections to the same peer race, both nodes keep
-    /// the one opened by the node with the lower ID, so they agree without coordinating.
-    /// A newer connection opened by the same side replaces the old one, which is likely stale.
-    fn register(&self, id: NodeId, new: Peer) -> bool {
+    /// Add the peer to the table, deciding which link wins when one already exists.
+    ///
+    /// Both ends must pick the same link without talking to each other, so the rule uses only
+    /// facts both share. If the existing link is older than [`RACE_WINDOW`], the new one
+    /// replaces it (the old one is probably dead, e.g. the peer restarted). Otherwise the two
+    /// links raced: keep the one opened by the node with the lower ID, and if the same node
+    /// opened both, the one with the lower session hash.
+    fn register(&self, id: NodeId, new: Peer) -> Registration {
         let mut peers = self.inner.peers.lock().unwrap();
-        if let Some(existing) = peers.get(&id) {
-            let preferred = self.id().min(id);
-            let keep_new = existing.initiator == new.initiator || new.initiator == preferred;
-            if !keep_new {
-                return false;
+        let outcome = match peers.get(&id) {
+            None if peers.len() >= MAX_PEERS => return Registration::Full,
+            None => Registration::New,
+            Some(existing) => {
+                let keep_new = prefer_new_link(
+                    self.id().min(id),
+                    (existing.initiator, existing.session),
+                    (new.initiator, new.session),
+                    existing.since.elapsed(),
+                );
+                if !keep_new {
+                    return Registration::Duplicate;
+                }
+                Registration::Replaced
             }
-        }
+        };
         peers.insert(id, new);
-        true
+        outcome
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -469,7 +547,10 @@ impl Node {
                     },
                     _ = keepalive.tick() => Message::Ping(0),
                 };
-                write_frame(&mut writer, &send.seal(&msg.encode())?).await?;
+                let frame = send.seal(&msg.encode())?;
+                tokio::time::timeout(WRITE_TIMEOUT, write_frame(&mut writer, &frame))
+                    .await
+                    .context("peer stopped reading")??;
             }
         };
 
@@ -525,5 +606,44 @@ impl Node {
             tracing::info!("disconnected from {}", peer.short());
             self.emit(Event::PeerDisconnected { id: peer });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Two racing links must produce the same winner on both ends, whichever order each end
+    /// saw them complete in.
+    #[test]
+    fn racing_links_resolve_the_same_way_on_both_ends() {
+        let (a, b) = (NodeId([1; 32]), NodeId([2; 32]));
+        let fresh = Duration::from_millis(5);
+        let winner = |first: (NodeId, [u8; 32]), second: (NodeId, [u8; 32])| {
+            if prefer_new_link(a.min(b), first, second, fresh) {
+                second
+            } else {
+                first
+            }
+        };
+        let links = [
+            ((a, [7; 32]), (a, [3; 32])), // both opened by a
+            ((b, [7; 32]), (b, [3; 32])), // both opened by b
+            ((a, [7; 32]), (b, [3; 32])), // one each
+        ];
+        for (l1, l2) in links {
+            assert_eq!(winner(l1, l2), winner(l2, l1), "{l1:?} vs {l2:?}");
+        }
+        assert_eq!(
+            winner((a, [9; 32]), (b, [1; 32])).0,
+            a,
+            "lower ID's link wins"
+        );
+    }
+
+    #[test]
+    fn a_stale_link_is_replaced() {
+        let (a, b) = (NodeId([1; 32]), NodeId([2; 32]));
+        assert!(prefer_new_link(a, (a, [0; 32]), (b, [9; 32]), RACE_WINDOW));
     }
 }

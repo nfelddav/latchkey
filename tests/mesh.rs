@@ -133,14 +133,16 @@ async fn simultaneous_connects_settle_on_one_link() {
 }
 
 #[tokio::test]
-async fn reconnect_after_restart_replaces_stale_link() {
+async fn reconnects_after_a_restart() {
     let a = Node::start(config()).await.unwrap();
     let b_config = config();
     let b = Node::start(b_config.clone()).await.unwrap();
     b.connect(a.local_addr()).await.unwrap();
+    wait_for("a to register b", || a.peers().len() == 1).await;
     b.shutdown();
+    wait_for("a to drop the old link", || a.peers().is_empty()).await;
 
-    // Same identity, new process: a must accept it even if it hasn't noticed the old link die.
+    // Same identity, new process.
     let b = Node::start(b_config).await.unwrap();
     let mut a_events = a.subscribe();
     b.connect(a.local_addr()).await.unwrap();
@@ -149,6 +151,39 @@ async fn reconnect_after_restart_replaces_stale_link() {
 
     a.shutdown();
     b.shutdown();
+}
+
+/// One node dialing the same peer twice at once (say, over IPv4 and IPv6) must leave both
+/// sides holding the same link, not each a different one.
+#[tokio::test]
+async fn duplicate_dials_from_one_side_settle_on_one_link() {
+    for _ in 0..3 {
+        let a = Node::start(config()).await.unwrap();
+        let b = Node::start(config()).await.unwrap();
+        let mut b_events = b.subscribe();
+
+        let (r1, r2, r3) = tokio::join!(
+            a.connect(b.local_addr()),
+            a.connect(b.local_addr()),
+            a.connect(b.local_addr()),
+        );
+        r1.unwrap();
+        r2.unwrap();
+        r3.unwrap();
+
+        wait_for("one link each", || {
+            a.peers().len() == 1 && b.peers().len() == 1
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(a.peers().len(), 1);
+        assert_eq!(b.peers().len(), 1);
+        a.send(&b.id(), b"one link".to_vec()).await.unwrap();
+        assert_eq!(next_message(&mut b_events).await.2, b"one link");
+
+        a.shutdown();
+        b.shutdown();
+    }
 }
 
 #[tokio::test]
@@ -212,4 +247,35 @@ async fn multicast_discovery_connects_nodes() {
     .await;
     a.shutdown();
     b.shutdown();
+}
+
+/// A peer that completes the handshake and then never reads must not make `send` hang.
+#[tokio::test]
+async fn send_fails_instead_of_hanging_when_the_peer_stops_reading() {
+    use latchkey::Identity;
+    use latchkey::handshake::{Role, handshake};
+
+    let a = Node::start(config()).await.unwrap();
+    let mut stalled = tokio::net::TcpStream::connect(a.local_addr())
+        .await
+        .unwrap();
+    let mallory = Identity::generate().unwrap();
+    handshake(&mut stalled, &mallory, Role::Initiator)
+        .await
+        .unwrap();
+    wait_for("a to register the peer", || a.peers().len() == 1).await;
+
+    let payload = vec![0u8; latchkey::node::MAX_MESSAGE];
+    let outcome = tokio::time::timeout(Duration::from_secs(90), async {
+        loop {
+            if let Err(e) = a.send(&mallory.id(), payload.clone()).await {
+                return e;
+            }
+        }
+    })
+    .await
+    .expect("send hung");
+    println!("send failed as expected: {outcome:#}");
+    drop(stalled);
+    a.shutdown();
 }

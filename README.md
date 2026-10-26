@@ -27,7 +27,7 @@ latchkey id                     # this node's ID
 latchkey peers                  # connected peers and whether you trust them
 latchkey ping 3f9a              # round-trip time to a peer (any unique ID prefix works)
 latchkey send 3f9a hello there  # direct message; it shows up in the peer's `latchkey run` output
-latchkey trust 3f9a             # add a peer to your allowlist
+latchkey trust 3f9a0c…           # add a peer to your allowlist (full 64-character ID only)
 latchkey untrust 3f9a
 latchkey trusted                # list the allowlist
 ```

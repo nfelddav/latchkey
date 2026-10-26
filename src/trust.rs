@@ -51,8 +51,9 @@ impl TrustStore {
     /// Add `id` and save. Returns false if it was already trusted.
     pub fn trust(&mut self, id: NodeId) -> Result<bool> {
         let added = self.trusted.insert(id);
-        if added {
-            self.save()?;
+        if added && let Err(e) = self.save() {
+            self.trusted.remove(&id);
+            return Err(e);
         }
         Ok(added)
     }
@@ -60,23 +61,34 @@ impl TrustStore {
     /// Remove `id` and save. Returns false if it was not trusted.
     pub fn untrust(&mut self, id: &NodeId) -> Result<bool> {
         let removed = self.trusted.remove(id);
-        if removed {
-            self.save()?;
+        if removed && let Err(e) = self.save() {
+            self.trusted.insert(*id);
+            return Err(e);
         }
         Ok(removed)
     }
 
+    /// Write the list to a temporary file and rename it into place, so a crash mid-write
+    /// never leaves a truncated allowlist.
     fn save(&self) -> Result<()> {
+        use std::io::Write;
+
         if let Some(dir) = self.path.parent() {
-            std::fs::create_dir_all(dir)?;
+            crate::identity::create_private_dir(dir)?;
         }
         let mut text = String::from("# Latchkey trusted node IDs, one per line\n");
         for id in &self.trusted {
             text.push_str(&id.to_string());
             text.push('\n');
         }
-        std::fs::write(&self.path, text)
-            .with_context(|| format!("writing trust file {}", self.path.display()))
+        let tmp = self.path.with_extension("tmp");
+        let write = || -> std::io::Result<()> {
+            let mut file = std::fs::File::create(&tmp)?;
+            file.write_all(text.as_bytes())?;
+            file.sync_all()?;
+            std::fs::rename(&tmp, &self.path)
+        };
+        write().with_context(|| format!("writing trust file {}", self.path.display()))
     }
 }
 

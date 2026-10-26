@@ -23,6 +23,7 @@ pub mod config;
 #[cfg(unix)]
 pub mod control;
 pub mod discovery;
+pub mod display;
 pub mod handshake;
 pub mod identity;
 pub mod node;

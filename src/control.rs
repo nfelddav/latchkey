@@ -12,6 +12,7 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 
+use crate::identity::NodeId;
 use crate::node::Node;
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -121,7 +122,12 @@ async fn execute(node: &Node, request: Request) -> Result<Value> {
             json!({ "id": id, "trusted": node.is_trusted(&id) })
         }
         Request::Trust { id } => {
-            let id = node.resolve(&id)?;
+            // Never trust by prefix: anyone can connect, and grinding a key whose ID matches a
+            // short prefix is cheap, so a prefix could resolve to an attacker's node.
+            let id: NodeId = id
+                .trim()
+                .parse()
+                .context("trust needs the full 64-character node ID (run `latchkey peers` or `latchkey id` on that node)")?;
             json!({ "id": id, "changed": node.trust(id)? })
         }
         Request::Untrust { id } => {
@@ -166,3 +172,59 @@ impl std::fmt::Display for NotRunning {
 }
 
 impl std::error::Error for NotRunning {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Config;
+    use crate::config::DiscoveryConfig;
+
+    #[tokio::test]
+    async fn trust_requires_a_full_node_id() {
+        let dir = std::env::temp_dir().join(format!("latchkey-control-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let config = |name: &str| Config {
+            data_dir: dir.join(name),
+            listen: "127.0.0.1:0".parse().unwrap(),
+            peers: vec![],
+            discovery: DiscoveryConfig {
+                enabled: false,
+                ..Default::default()
+            },
+        };
+        let a = Node::start(config("a")).await.unwrap();
+        let b = Node::start(config("b")).await.unwrap();
+        b.connect(a.local_addr()).await.unwrap();
+
+        let prefix = a.id().to_string()[..8].to_string();
+        // Prefixes still work for everyday commands...
+        assert!(
+            execute(
+                &b,
+                Request::Ping {
+                    peer: prefix.clone()
+                }
+            )
+            .await
+            .is_ok()
+        );
+        // ...but not for trust.
+        assert!(execute(&b, Request::Trust { id: prefix }).await.is_err());
+        assert!(!b.is_trusted(&a.id()));
+        assert!(
+            execute(
+                &b,
+                Request::Trust {
+                    id: a.id().to_string()
+                }
+            )
+            .await
+            .is_ok()
+        );
+        assert!(b.is_trusted(&a.id()));
+
+        a.shutdown();
+        b.shutdown();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+}

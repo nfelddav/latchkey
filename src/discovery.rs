@@ -57,10 +57,11 @@ pub fn spawn(
     let interval = Duration::from_secs(config.interval_secs.max(1));
     let port = config.port;
     match bind_v4(port) {
-        Ok(socket) => {
+        Ok((listen, send)) => {
             let target = SocketAddr::from((GROUP_V4, port));
             tokio::spawn(run(
-                socket,
+                listen,
+                send,
                 target,
                 id,
                 tcp_port,
@@ -73,17 +74,21 @@ pub fn spawn(
     }
     if config.ipv6 {
         match bind_v6(port) {
-            Ok(socket) => {
+            Ok((listen, send)) => {
                 let target = SocketAddr::from((GROUP_V6, port));
-                tokio::spawn(run(socket, target, id, tcp_port, interval, found, shutdown));
+                tokio::spawn(run(
+                    listen, send, target, id, tcp_port, interval, found, shutdown,
+                ));
             }
             Err(e) => tracing::debug!("IPv6 multicast discovery unavailable: {e:#}"),
         }
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run(
-    socket: UdpSocket,
+    listen: UdpSocket,
+    send: UdpSocket,
     target: SocketAddr,
     id: NodeId,
     tcp_port: u16,
@@ -99,16 +104,16 @@ async fn run(
         tokio::select! {
             _ = shutdown.changed() => return,
             _ = ticker.tick() => {
-                if let Err(e) = socket.send_to(&announcement, target).await
+                if let Err(e) = send.send_to(&announcement, target).await
                     && !warned {
                         tracing::warn!("multicast announce to {target} failed: {e}");
                         warned = true;
                     }
             }
-            received = socket.recv_from(&mut buf) => {
+            received = listen.recv_from(&mut buf) => {
                 let Ok((len, from)) = received else { continue };
                 let Some((peer, port)) = decode_announce(&buf[..len]) else { continue };
-                if peer == id {
+                if peer == id || !on_link_source(&from.ip()) {
                     continue;
                 }
                 let addr = SocketAddr::new(from.ip(), port);
@@ -136,30 +141,75 @@ fn shared_socket(domain: Domain) -> Result<Socket> {
     Ok(socket)
 }
 
-fn bind_v4(port: u16) -> Result<UdpSocket> {
-    let socket = shared_socket(Domain::IPV4)?;
-    socket.bind(&SocketAddr::from((Ipv4Addr::UNSPECIFIED, port)).into())?;
-    socket.join_multicast_v4(&GROUP_V4, &Ipv4Addr::UNSPECIFIED)?;
-    socket.set_multicast_loop_v4(true)?;
-    socket.set_multicast_ttl_v4(1)?;
-    Ok(UdpSocket::from_std(socket.into())?)
+/// The address the IPv4 listening socket binds to. On Unix, binding to the group address
+/// itself means the kernel only delivers datagrams sent to the group, so a host that can merely
+/// reach the port with unicast (from anywhere, with a spoofed source) cannot inject
+/// announcements.
+fn listen_addr_v4(port: u16) -> SocketAddr {
+    if cfg!(unix) {
+        SocketAddr::from((GROUP_V4, port))
+    } else {
+        SocketAddr::from((Ipv4Addr::UNSPECIFIED, port))
+    }
 }
 
-fn bind_v6(port: u16) -> Result<UdpSocket> {
-    let socket = shared_socket(Domain::IPV6)?;
-    socket.set_only_v6(true)?;
-    socket.bind(&SocketAddr::from((Ipv6Addr::UNSPECIFIED, port)).into())?;
-    socket.join_multicast_v6(&GROUP_V6, 0)?;
-    socket.set_multicast_loop_v6(true)?;
-    Ok(UdpSocket::from_std(socket.into())?)
+/// True if an announcement from `source` may have come from the local network.
+///
+/// IPv4 relies on the socket being bound to the group. IPv6 announcements go to a link-local
+/// group and so carry a link-local source, which routers never forward; requiring one rejects
+/// anything from off the link.
+pub fn on_link_source(source: &IpAddr) -> bool {
+    match source {
+        IpAddr::V4(_) => true,
+        IpAddr::V6(ip) => (ip.segments()[0] & 0xffc0) == 0xfe80,
+    }
 }
 
-/// True for addresses discovery should dial. Filters out unspecified and multicast sources.
+/// Returns (listening socket, sending socket).
+fn bind_v4(port: u16) -> Result<(UdpSocket, UdpSocket)> {
+    let listen = shared_socket(Domain::IPV4)?;
+    listen.bind(&listen_addr_v4(port).into())?;
+    listen.join_multicast_v4(&GROUP_V4, &Ipv4Addr::UNSPECIFIED)?;
+
+    let send = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
+    send.set_nonblocking(true)?;
+    send.bind(&SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)).into())?;
+    send.set_multicast_loop_v4(true)?;
+    send.set_multicast_ttl_v4(1)?;
+    Ok((
+        UdpSocket::from_std(listen.into())?,
+        UdpSocket::from_std(send.into())?,
+    ))
+}
+
+/// Returns (listening socket, sending socket).
+fn bind_v6(port: u16) -> Result<(UdpSocket, UdpSocket)> {
+    let listen = shared_socket(Domain::IPV6)?;
+    listen.set_only_v6(true)?;
+    listen.bind(&SocketAddr::from((Ipv6Addr::UNSPECIFIED, port)).into())?;
+    listen.join_multicast_v6(&GROUP_V6, 0)?;
+
+    let send = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
+    send.set_nonblocking(true)?;
+    send.set_only_v6(true)?;
+    send.bind(&SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0)).into())?;
+    send.set_multicast_loop_v6(true)?;
+    send.set_multicast_hops_v6(1)?;
+    Ok((
+        UdpSocket::from_std(listen.into())?,
+        UdpSocket::from_std(send.into())?,
+    ))
+}
+
+/// True for announced addresses discovery should dial: a unicast source and an unprivileged
+/// port. The port check stops forged announcements from pointing nodes at services such as
+/// SSH; Latchkey's own port is always 1024 or above.
 pub fn dialable(addr: &SocketAddr) -> bool {
-    match addr.ip() {
+    let ip_ok = match addr.ip() {
         IpAddr::V4(ip) => !ip.is_unspecified() && !ip.is_multicast() && !ip.is_broadcast(),
         IpAddr::V6(ip) => !ip.is_unspecified() && !ip.is_multicast(),
-    }
+    };
+    ip_ok && addr.port() >= 1024
 }
 
 #[cfg(test)]
@@ -173,6 +223,41 @@ mod tests {
             decode_announce(&encode_announce(&id, 47470)),
             Some((id, 47470))
         );
+    }
+
+    #[test]
+    fn dials_only_unicast_unprivileged_addresses() {
+        assert!(dialable(&"192.168.1.5:47470".parse().unwrap()));
+        assert!(dialable(&"[fe80::1]:47470".parse().unwrap()));
+        assert!(!dialable(&"192.168.1.5:22".parse().unwrap()));
+        assert!(!dialable(&"0.0.0.0:47470".parse().unwrap()));
+        assert!(!dialable(&"239.255.76.75:47470".parse().unwrap()));
+    }
+
+    /// A datagram sent straight to the host (not to the group) must not reach discovery.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ignores_unicast_announcements() {
+        let port = 30000 + (std::process::id() % 20000) as u16;
+        let (listen, _send) = bind_v4(port).unwrap();
+        let sender = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        sender
+            .send_to(
+                &encode_announce(&NodeId([1; 32]), 5000),
+                ("127.0.0.1", port),
+            )
+            .unwrap();
+        let mut buf = [0u8; 64];
+        let got =
+            tokio::time::timeout(Duration::from_millis(300), listen.recv_from(&mut buf)).await;
+        assert!(got.is_err(), "unicast datagram was delivered: {got:?}");
+    }
+
+    #[test]
+    fn ipv6_announcements_must_come_from_link_local_addresses() {
+        assert!(on_link_source(&"fe80::1".parse().unwrap()));
+        assert!(!on_link_source(&"2001:db8::1".parse().unwrap()));
+        assert!(!on_link_source(&"fd00::1".parse().unwrap()));
     }
 
     #[test]

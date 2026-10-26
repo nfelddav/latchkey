@@ -5,6 +5,7 @@ use std::path::Path;
 use std::str::FromStr;
 
 use anyhow::{Context, Result, bail};
+use ml_dsa::common::getrandom::SysRng;
 use ml_dsa::signature::Keypair;
 use ml_dsa::{EncodedVerifyingKey, MlDsa65, Signature, SigningKey, VerifyingKey};
 use sha3::{Digest, Sha3_256};
@@ -48,6 +49,7 @@ impl Identity {
     /// Load the identity stored at `path`, creating and saving a new one if it does not exist.
     pub fn load_or_create(path: &Path) -> Result<Self> {
         if path.exists() {
+            warn_if_exposed(path);
             let text = Zeroizing::new(
                 std::fs::read_to_string(path)
                     .with_context(|| format!("reading identity {}", path.display()))?,
@@ -62,7 +64,7 @@ impl Identity {
         }
         let identity = Self::generate()?;
         if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir)?;
+            create_private_dir(dir)?;
         }
         let seed = Zeroizing::new(hex::encode(identity.signing_key.to_seed()));
         write_private(path, seed.as_bytes())
@@ -79,13 +81,15 @@ impl Identity {
         self.verifying_key.encode().to_vec()
     }
 
-    pub fn sign(&self, message: &[u8]) -> Vec<u8> {
-        self.signing_key
+    /// Sign with hedged (randomized) ML-DSA, as FIPS 204 recommends, to blunt fault and
+    /// side-channel attacks on the deterministic variant.
+    pub fn sign(&self, message: &[u8]) -> Result<Vec<u8>> {
+        let signature = self
+            .signing_key
             .expanded_key()
-            .sign_deterministic(message, SIGNATURE_CONTEXT)
-            .expect("context is shorter than 255 bytes")
-            .encode()
-            .to_vec()
+            .sign_randomized(message, SIGNATURE_CONTEXT, &mut SysRng)
+            .map_err(|_| anyhow::anyhow!("ML-DSA signing failed"))?;
+        Ok(signature.encode().to_vec())
     }
 }
 
@@ -103,6 +107,35 @@ pub fn verify(verifying_key: &[u8], message: &[u8], signature: &[u8]) -> Result<
     }
     Ok(NodeId::from_verifying_key(&key))
 }
+
+/// Create `dir` and any missing parents. On Unix, directories it creates are mode 0700.
+pub(crate) fn create_private_dir(dir: &Path) -> std::io::Result<()> {
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(dir)
+}
+
+#[cfg(unix)]
+fn warn_if_exposed(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    if let Ok(meta) = std::fs::metadata(path) {
+        let mode = meta.permissions().mode() & 0o777;
+        if mode & 0o077 != 0 {
+            tracing::warn!(
+                "{} is readable by other users (mode {mode:o}); run `chmod 600` on it",
+                path.display()
+            );
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn warn_if_exposed(_path: &Path) {}
 
 #[cfg(unix)]
 fn write_private(path: &Path, contents: &[u8]) -> std::io::Result<()> {
@@ -180,7 +213,7 @@ mod tests {
     #[test]
     fn sign_and_verify_round_trip() {
         let identity = Identity::generate().unwrap();
-        let signature = identity.sign(b"hello");
+        let signature = identity.sign(b"hello").unwrap();
         assert_eq!(signature.len(), SIGNATURE_LEN);
         let vk = identity.verifying_key_bytes();
         assert_eq!(vk.len(), VERIFYING_KEY_LEN);
